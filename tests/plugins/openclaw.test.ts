@@ -788,6 +788,104 @@ describe("OpenClawPlugin", () => {
       expect(params.command).toContain("context-mode");
     });
   });
+
+  // ═══════════════════════════════════════════════════════════
+  // Issue #645 follow-up — OpenClaw plugin SessionDB path must
+  // match the MCP server's canonical resolver. The pre-fix code
+  // computed a raw `sha256(projectDir).slice(0, 16)` directly,
+  // which misses case-folding on darwin/win32 and the worktree
+  // suffix. `resolveSessionDbPath` handles both. Without this,
+  // any OpenClaw user whose projectDir contains an uppercase
+  // character (typical on macOS — `/Users/Foo/Projects/Bar`)
+  // sees `ctx_stats` and `ctx_search(sort: "timeline")` silently
+  // degrade because the MCP server reads the case-folded
+  // canonical hash while the plugin writes to the raw hash.
+  // ═══════════════════════════════════════════════════════════
+
+  describe("Issue #645 follow-up: SessionDB path matches MCP server's canonical resolver", () => {
+    it("writes SessionDB to resolveSessionDbPath({projectDir, sessionsDir}), not raw sha256(projectDir).slice(0,16)", async () => {
+      // Pick a mixed-case project dir so the canonical (case-folded)
+      // hash diverges from the raw hash on darwin/win32. On Linux
+      // the two coincide by design (case-sensitive FS) so the
+      // assertion still passes — it just stops catching the bug.
+      // On macOS `/var/...` is a symlink to `/private/var/...`, and
+      // `process.chdir()` followed by `process.cwd()` returns the
+      // realpath. The plugin reads `process.cwd()` for projectDir, so
+      // we must hash the realpath form too (otherwise the canonical
+      // hash we compute below diverges from the one the plugin used).
+      const { realpathSync } = await import("node:fs");
+      const mixedCaseProject = realpathSync(
+        mkdtempSync(join(tmpdir(), "OpenClaw-Mixed-")),
+      );
+      const prevCwd = process.cwd();
+      const priorOverride = process.env.CONTEXT_MODE_DATA_DIR;
+      // Route the OpenClaw sessions dir into a fresh scratch root so
+      // we never collide with the developer's real ~/.openclaw DB.
+      const dataRoot = mkdtempSync(join(tmpdir(), "openclaw-645-root-"));
+      process.env.CONTEXT_MODE_DATA_DIR = dataRoot;
+      try {
+        // OpenClaw plugin resolves projectDir via process.cwd() at
+        // register() time (src/adapters/openclaw/plugin.ts:250).
+        process.chdir(mixedCaseProject);
+        vi.resetModules();
+        const { default: plugin } = await import(
+          "../../src/adapters/openclaw/plugin.js"
+        );
+        const mock = createMockApiFull();
+        plugin.register(mock.api);
+
+        // Compute the canonical hash INLINE (do NOT call
+        // resolveSessionDbPath here — that helper performs a one-shot
+        // legacy→canonical rename when only the legacy file exists,
+        // which would silently migrate the pre-fix raw-hash DB into a
+        // canonical-hash file and make this test a tautology that
+        // always passes. We need to observe what's actually on disk
+        // before any migration runs.
+        const { hashProjectDirCanonical } = await import(
+          "../../src/session/db.js"
+        );
+        const sessionsDir = join(
+          dataRoot,
+          "context-mode",
+          "sessions",
+        );
+        const canonicalHash = hashProjectDirCanonical(mixedCaseProject);
+        const canonicalPath = join(sessionsDir, `${canonicalHash}.db`);
+
+        const { existsSync: fileExists } = await import("node:fs");
+        expect(fileExists(canonicalPath)).toBe(true);
+
+        // The pre-fix raw-sha256 literal must NOT be created. On
+        // darwin/win32 the raw hash diverges from the canonical
+        // (case-folded) hash for any mixedCaseProject. On Linux they
+        // coincide — the assertion becomes a self-check that still
+        // passes correctly via the canonical branch.
+        const { createHash } = await import("node:crypto");
+        const rawHash = createHash("sha256")
+          .update(mixedCaseProject)
+          .digest("hex")
+          .slice(0, 16);
+        const buggyRawPath = join(sessionsDir, `${rawHash}.db`);
+        if (canonicalPath !== buggyRawPath) {
+          expect(fileExists(buggyRawPath)).toBe(false);
+        }
+
+        // Mock api is registered solely to flush plugin init; we
+        // assert against the on-disk DB file the plugin opened.
+        void mock;
+      } finally {
+        try { process.chdir(prevCwd); } catch { /* best effort */ }
+        try { rmSync(mixedCaseProject, { recursive: true, force: true }); } catch { /* best effort */ }
+        try { rmSync(dataRoot, { recursive: true, force: true }); } catch { /* best effort */ }
+        if (priorOverride === undefined) {
+          delete process.env.CONTEXT_MODE_DATA_DIR;
+        } else {
+          process.env.CONTEXT_MODE_DATA_DIR = priorOverride;
+        }
+        vi.resetModules();
+      }
+    });
+  });
 });
 
 // ═══════════════════════════════════════════════════════════

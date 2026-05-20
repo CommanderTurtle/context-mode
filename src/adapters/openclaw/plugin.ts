@@ -36,7 +36,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { resolveContextModeDataRoot } from "../base.js";
-import { SessionDB } from "../../session/db.js";
+import { resolveSessionDbPath, SessionDB } from "../../session/db.js";
 import { OpenClawSessionDB } from "./session-db.js";
 import { extractEvents, extractUserEvents } from "../../session/extract.js";
 import type { HookInput } from "../../session/extract.js";
@@ -200,12 +200,19 @@ function getSessionDir(): string {
   return dir;
 }
 
+// Issue #645 follow-up — route through the canonical per-project
+// resolver the MCP server uses (src/server.ts ctx_stats / ctx_search
+// timeline). The previous raw `sha256(projectDir).slice(0, 16)` shape
+// produced a different file from the `<canonical-hash>.db` the server
+// reads on darwin/win32 (case-fold) and inside linked worktrees
+// (suffix). The result was silent degradation of `ctx_stats` (zero
+// history) and `ctx_search(sort: "timeline")` (sort dropped) for any
+// OpenClaw user with an uppercase character in their projectDir.
+// Mirrors the matching Pi (src/adapters/pi/extension.ts:223) and OMP
+// (src/adapters/omp/plugin.ts:90) fixes, and the opencode plugin
+// pattern (src/adapters/opencode/plugin.ts:307).
 function getDBPath(projectDir: string): string {
-  const hash = createHash("sha256")
-    .update(projectDir)
-    .digest("hex")
-    .slice(0, 16);
-  return join(getSessionDir(), `${hash}.db`);
+  return resolveSessionDbPath({ projectDir, sessionsDir: getSessionDir() });
 }
 
 // ── Module-level DB singleton ─────────────────────────────
@@ -213,10 +220,22 @@ function getDBPath(projectDir: string): string {
 // Lazy-initialized on first register() using the first projectDir seen.
 // Uses OpenClawSessionDB for session_key mapping and rename support.
 let _dbSingleton: OpenClawSessionDB | null = null;
+let _dbSingletonPath = "";
 function getOrCreateDB(projectDir: string): OpenClawSessionDB {
-  if (!_dbSingleton) {
-    const dbPath = getDBPath(projectDir);
+  // Reopen the singleton if the resolved DB path changes. Production
+  // code normally loads the plugin once per process with a single
+  // workspace, but defensive re-keying on resolved path keeps the
+  // contract honest if a host ever calls register() twice with
+  // different projectDirs, and removes a subtle test-isolation
+  // foot-gun where a stale singleton pointed at a prior test's
+  // `<hash>.db`. Mirrors the Pi/OMP fix (#645).
+  const dbPath = getDBPath(projectDir);
+  if (!_dbSingleton || _dbSingletonPath !== dbPath) {
+    if (_dbSingleton) {
+      try { _dbSingleton.close(); } catch { /* best effort */ }
+    }
     _dbSingleton = new OpenClawSessionDB({ dbPath });
+    _dbSingletonPath = dbPath;
     _dbSingleton.cleanupOldSessions(7);
   }
   return _dbSingleton;
