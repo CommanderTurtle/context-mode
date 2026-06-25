@@ -8,7 +8,7 @@
 import {
   lookupPrice as catalogLookupPrice,
   computeCostUsd as catalogComputeCostUsd,
-} from "../pricing/catalog.js";
+} from "./pricing.js";
 
 // ── Public interfaces ──────────────────────────────────────────────────────
 
@@ -30,6 +30,19 @@ export interface SessionEvent {
    * `Fetched and indexed N sections (XKB)` preamble.
    */
   bytes_avoided?: number;
+  /**
+   * Optional structured cost/usage fields (Wave 2b). Emitted by
+   * extractAgentUsage alongside the colon-string `data` so the forward
+   * envelope can spread them to the platform as typed columns instead of an
+   * opaque blob. Present only when the source signal is present; cost_usd is
+   * omitted on a price miss or a zero-token turn.
+   */
+  model_id?: string;
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_read_tokens?: number;
+  cache_creation_tokens?: number;
+  cost_usd?: number;
 }
 
 export interface ToolCall {
@@ -1487,21 +1500,39 @@ function extractAgentUsage(input: HookInput): SessionEvent[] {
   const cacheRead = typeof usage.cache_read_input_tokens === "number"
     ? usage.cache_read_input_tokens
     : 0;
+  const modelId = resolveModelId(input, out);
   const anyTokens = inputTokens > 0 || outputTokens > 0 || cacheCreate > 0 || cacheRead > 0;
+  let cost: number | null = null;
   if (anyTokens) {
-    const modelId = resolveModelId(input, out);
     // null ⇒ unmatched model id (catalog warned once) — skip the cost token
     // rather than blend a wrong Claude rate (the old non-Claude bug).
-    const cost = computeTurnCostUsd(modelId, inputTokens, outputTokens, cacheCreate, cacheRead);
+    cost = computeTurnCostUsd(modelId, inputTokens, outputTokens, cacheCreate, cacheRead);
     if (cost !== null) parts.push(`cost_usd:${formatCostUsd(cost)}`);
   }
 
-  return [{
+  // Wave 2b — emit structured top-level fields alongside the colon-string so
+  // the forward envelope (which spreads `...event`) hands the platform typed
+  // columns. Each field is set only when its source signal is present, so the
+  // forward payload stays minimal; cost_usd is omitted on a price miss or a
+  // zero-token turn. The colon-string `data` stays for human/debug + back-compat.
+  const event: SessionEvent = {
     type: "agent_usage",
     category: "cost",
     data: safeString(parts.join(" ")),
     priority: 2,
-  }];
+  };
+  if (modelId.length > 0) event.model_id = modelId;
+  if (typeof usage.input_tokens === "number") event.input_tokens = usage.input_tokens;
+  if (typeof usage.output_tokens === "number") event.output_tokens = usage.output_tokens;
+  if (typeof usage.cache_read_input_tokens === "number") {
+    event.cache_read_tokens = usage.cache_read_input_tokens;
+  }
+  if (typeof usage.cache_creation_input_tokens === "number") {
+    event.cache_creation_tokens = usage.cache_creation_input_tokens;
+  }
+  if (cost !== null) event.cost_usd = cost;
+
+  return [event];
 }
 
 // ── User-message extractors ────────────────────────────────────────────────

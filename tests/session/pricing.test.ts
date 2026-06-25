@@ -6,7 +6,7 @@
  * a Claude rate (non-Claude models silently inherited Sonnet's default),
  * which over-/under-charged every OpenAI / Gemini / Qwen / DeepSeek turn.
  *
- * The catalog merges the 5 curated vendor JSONs (src/pricing/sources/*.json)
+ * The catalog reads the curated multi-vendor JSON (src/session/model-prices.json)
  * into one per-Mtok price map and prices each model from ITS OWN row.
  * Behaviours under test:
  *   (a) curated lookup hits across all five vendors
@@ -23,9 +23,9 @@ import {
   lookupPrice,
   computeCostUsd,
   nativeOrComputed,
-} from "../../src/pricing/catalog.js";
+} from "../../src/session/pricing.js";
 
-describe("pricing/catalog — lookupPrice", () => {
+describe("session/pricing — lookupPrice", () => {
   // (a) curated lookup hits
   test("(a) Anthropic curated hit returns per-Mtok price", () => {
     const p = lookupPrice("claude-opus-4-8");
@@ -79,7 +79,7 @@ describe("pricing/catalog — lookupPrice", () => {
   });
 });
 
-describe("pricing/catalog — computeCostUsd", () => {
+describe("session/pricing — computeCostUsd", () => {
   // (c) THE BUG: non-Claude model must use its own price, not Claude's.
   test("(c) gpt-5 priced from its own row, NOT Claude default", () => {
     const tokens = { input_tokens: 1000, output_tokens: 500 };
@@ -157,7 +157,7 @@ describe("pricing/catalog — computeCostUsd", () => {
   });
 });
 
-describe("pricing/catalog — nativeOrComputed", () => {
+describe("session/pricing — nativeOrComputed", () => {
   // (g) native-cost passthrough
   test("(g) provider native cost wins over computed", () => {
     const native = nativeOrComputed("gpt-5", { input_tokens: 1000 }, 0.42);

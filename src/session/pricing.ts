@@ -1,9 +1,9 @@
 /**
  * Pricing catalog — single source of truth for per-model USD cost.
  *
- * Deep module, tiny interface. At load it merges the 5 curated vendor JSONs
- * (src/pricing/sources/{anthropic,openai,google,chinese,others}.json) into one
- * Map<modelId, Price> in per-Mtok units, then exposes three pure-ish functions:
+ * Deep module, tiny interface. At load it reads one curated multi-vendor JSON
+ * (src/session/model-prices.json) into a Map<modelId, Price> in per-Mtok units,
+ * then exposes three pure-ish functions:
  *
  *   lookupPrice(modelId)            → Price | null
  *   computeCostUsd(modelId, tokens) → number  | null
@@ -17,18 +17,14 @@
  * an unknown id resolves to `null` (no price) instead of a wrong Claude rate.
  *
  * The large litellm catalog (~1.5MB, ~2900 models) is NOT bundled — it lives at
- * tools/pricing/litellm-catalog.json as the dev-only refresh base for these
- * curated JSONs. See tools/pricing/litellm-NOTES.md for the refresh recipe.
+ * tools/pricing/litellm-catalog.json as the dev-only refresh base for this
+ * curated JSON.
  *
- * The 5 curated JSONs are small (~25KB total) and esbuild inlines them into the
+ * The curated JSON is small (~13KB, 61 models) and esbuild inlines it into the
  * hook/server bundles at build time (no runtime fs read, no external file).
  */
 
-import anthropic from "./sources/anthropic.json" with { type: "json" };
-import openai from "./sources/openai.json" with { type: "json" };
-import google from "./sources/google.json" with { type: "json" };
-import chinese from "./sources/chinese.json" with { type: "json" };
-import others from "./sources/others.json" with { type: "json" };
+import catalog from "./model-prices.json" with { type: "json" };
 
 /** Per-Mtok price for one model. Any of the four rates may be null ("unknown"). */
 export interface Price {
@@ -46,7 +42,7 @@ export interface TokenCounts {
   cache_creation_tokens?: number;
 }
 
-/** Raw shape of a curated source row (carries provenance fields we drop). */
+/** Raw shape of a curated source row (carries a provenance `source` we drop). */
 interface RawRow {
   input_per_mtok: number | null;
   output_per_mtok: number | null;
@@ -56,36 +52,28 @@ interface RawRow {
 }
 
 /**
- * Merge the 5 vendor JSONs into one Map. A row with a null *input* price is
+ * Read the curated JSON into one Map. A row with a null *input* price is
  * unusable for cost (the primary bucket has no rate) and is dropped at load so
  * lookupPrice returns null for it — matching "null-priced entries → no price".
- * Curated ids are globally unique across the five files (verified), so merge
- * order is irrelevant; later files would otherwise win on collision.
+ * (The two null-input ids are already pruned from the JSON itself; this guard
+ * keeps the loader robust if one is ever re-added.)
  */
 function buildCatalog(): Map<string, Price> {
   const map = new Map<string, Price>();
-  const sources: Record<string, RawRow>[] = [
-    anthropic as Record<string, RawRow>,
-    openai as Record<string, RawRow>,
-    google as Record<string, RawRow>,
-    chinese as Record<string, RawRow>,
-    others as Record<string, RawRow>,
-  ];
-  for (const src of sources) {
-    for (const id of Object.keys(src)) {
-      const row = src[id];
-      if (row == null || typeof row !== "object") continue;
-      // No input rate ⇒ no usable price for this model.
-      if (typeof row.input_per_mtok !== "number") continue;
-      map.set(id, {
-        input_per_mtok: row.input_per_mtok,
-        output_per_mtok: typeof row.output_per_mtok === "number" ? row.output_per_mtok : null,
-        cache_read_per_mtok:
-          typeof row.cache_read_per_mtok === "number" ? row.cache_read_per_mtok : null,
-        cache_write_per_mtok:
-          typeof row.cache_write_per_mtok === "number" ? row.cache_write_per_mtok : null,
-      });
-    }
+  const src = catalog as Record<string, RawRow>;
+  for (const id of Object.keys(src)) {
+    const row = src[id];
+    if (row == null || typeof row !== "object") continue;
+    // No input rate ⇒ no usable price for this model.
+    if (typeof row.input_per_mtok !== "number") continue;
+    map.set(id, {
+      input_per_mtok: row.input_per_mtok,
+      output_per_mtok: typeof row.output_per_mtok === "number" ? row.output_per_mtok : null,
+      cache_read_per_mtok:
+        typeof row.cache_read_per_mtok === "number" ? row.cache_read_per_mtok : null,
+      cache_write_per_mtok:
+        typeof row.cache_write_per_mtok === "number" ? row.cache_write_per_mtok : null,
+    });
   }
   return map;
 }

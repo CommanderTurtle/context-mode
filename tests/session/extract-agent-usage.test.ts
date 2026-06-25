@@ -292,3 +292,90 @@ describe("extractAgentUsage — Issue #4 AgentOutput.usage capture", () => {
     }
   });
 });
+
+/**
+ * Wave 2b — structured cost event.
+ *
+ * The colon-string `data` is opaque to the platform (it cannot column-ize a
+ * "tokens_in:123 cost_usd:0.02" blob). extractAgentUsage now also emits the
+ * cost/token signals as top-level SessionEvent fields, which the forward
+ * envelope spreads straight to the platform as typed columns:
+ *
+ *   model_id, input_tokens, output_tokens,
+ *   cache_read_tokens, cache_creation_tokens, cost_usd
+ *
+ * The colon-string `data` stays for human/debug + back-compat.
+ */
+describe("extractAgentUsage — Wave 2b structured cost fields", () => {
+  function usageEvent(toolInput: Record<string, unknown>, usage: Record<string, unknown>, extra: Record<string, unknown> = {}) {
+    return extractEvents({
+      tool_name: "Task",
+      tool_input: toolInput,
+      tool_response: JSON.stringify({ ...extra, usage }),
+    }).filter((e) => e.type === "agent_usage")[0];
+  }
+
+  // (a) the 6 structured fields ride the event with correct values
+  test("(a) Task usage yields event carrying the 6 structured fields with correct values", () => {
+    const ev = usageEvent(
+      { model: "claude-sonnet-4-6" },
+      {
+        input_tokens: 1000,
+        output_tokens: 500,
+        cache_creation_input_tokens: 1000,
+        cache_read_input_tokens: 1500,
+      },
+    );
+    expect(ev.model_id).toBe("claude-sonnet-4-6");
+    expect(ev.input_tokens).toBe(1000);
+    expect(ev.output_tokens).toBe(500);
+    expect(ev.cache_creation_tokens).toBe(1000);
+    expect(ev.cache_read_tokens).toBe(1500);
+    // 1000*3 + 500*15 + 1000*3.75 + 1500*0.30 = 14700 / 1e6 = 0.0147
+    expect(ev.cost_usd).toBeCloseTo(0.0147, 8);
+  });
+
+  // (b) cost_usd matches the catalog for a known model
+  test("(b) cost_usd matches the catalog for a known model (gpt-5)", () => {
+    const ev = usageEvent(
+      { model: "gpt-5" },
+      { input_tokens: 1000, output_tokens: 500 },
+    );
+    // gpt-5: 1000*1.25 + 500*10 = 6250 / 1e6 = 0.00625
+    expect(ev.cost_usd).toBeCloseTo(0.00625, 8);
+    expect(ev.model_id).toBe("gpt-5");
+  });
+
+  // (c) unknown model → tokens present, cost_usd omitted (no Claude fallback)
+  test("(c) unknown model → tokens present, cost_usd omitted/null", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const ev = usageEvent(
+      { model: "claude-future-model-99" },
+      { input_tokens: 1000, output_tokens: 500 },
+    );
+    warn.mockRestore();
+    expect(ev.input_tokens).toBe(1000);
+    expect(ev.output_tokens).toBe(500);
+    expect(ev.cost_usd == null).toBe(true);
+  });
+
+  // (d) zero-token response → no cost_usd
+  test("(d) zero-token response → no cost_usd", () => {
+    const ev = usageEvent(
+      { model: "claude-sonnet-4-6" },
+      { input_tokens: 0, output_tokens: 0 },
+    );
+    expect(ev.cost_usd == null).toBe(true);
+  });
+
+  // (e) the existing colon-string `data` still present for back-compat
+  test("(e) colon-string data still present for back-compat", () => {
+    const ev = usageEvent(
+      { model: "claude-sonnet-4-6" },
+      { input_tokens: 1000, output_tokens: 500 },
+    );
+    expect(ev.data).toMatch(/tokens_in:1000/);
+    expect(ev.data).toMatch(/tokens_out:500/);
+    expect(ev.data).toMatch(/cost_usd:0\.0105/);
+  });
+});
