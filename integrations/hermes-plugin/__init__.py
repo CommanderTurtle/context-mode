@@ -6,6 +6,8 @@ public Hermes plugin lifecycle into that wire protocol.
 """
 from __future__ import annotations
 
+from collections import OrderedDict
+import hashlib
 import json
 import os
 import shutil
@@ -20,13 +22,15 @@ _INDEX_TIMEOUT = 8.0
 _MAX_CAPTURE = 2 * 1024 * 1024
 _INDEX_THRESHOLD = 16 * 1024
 _CTX_PREFIX = "mcp__context_mode__ctx_"
+_COMPRESSED_SUMMARY_KEY = "_compressed_summary"
+_MAX_TRACKED_SESSIONS = 512
 _ALIASES = {"terminal": "Bash", "delegate_task": "Agent", "search_files": "Grep"}
 # Mutating/interactive results must remain verbatim. Context-mode's own tools
 # are also exempt to prevent recursive indexing.
 _RESULT_TOOLS = {"read_file", "search_files", "web_extract", "web_search", "browser_snapshot", "browser_console", "browser_extract"}
 _state_lock = threading.RLock()
 _index_lock = threading.Lock()
-_seen_sessions: set[str] = set()
+_session_summaries: OrderedDict[str, str | None] = OrderedDict()
 _ctx: Any = None
 
 
@@ -36,6 +40,54 @@ def _sid(kwargs: dict[str, Any]) -> str:
 
 def _project(kwargs: dict[str, Any]) -> str:
     return str(kwargs.get("project_dir") or kwargs.get("cwd") or os.getcwd())
+
+
+def _compaction_fingerprint(history: Any) -> str | None:
+    """Identify Hermes' rebuilt history without relying on an unshipped hook flag.
+
+    Hermes invokes ``pre_llm_call`` after compaction and passes the rebuilt
+    in-memory message list as ``conversation_history``. Its exact
+    ``_compressed_summary`` metadata is still present there (wire sanitizers
+    remove it only later). Hashing only those marked messages lets us detect a
+    new compaction once while ignoring the same summary on following turns.
+    """
+    if not isinstance(history, list):
+        return None
+    summaries = [
+        {
+            "role": message.get("role"),
+            "content": message.get("content"),
+            "has_user_turn": message.get("_compressed_summary_has_user_turn"),
+            "micro": message.get("_micro_compact_marker"),
+        }
+        for message in history
+        if isinstance(message, dict) and message.get(_COMPRESSED_SUMMARY_KEY) is True
+    ]
+    if not summaries:
+        return None
+    try:
+        encoded = json.dumps(
+            summaries,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=lambda value: f"<{type(value).__module__}.{type(value).__qualname__}>",
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        return None
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _remember_session(sid: str, fingerprint: str | None) -> tuple[bool, str | None]:
+    """Return prior state and retain a bounded per-process compaction edge."""
+    known = sid in _session_summaries
+    previous = _session_summaries.get(sid)
+    if fingerprint is not None or not known:
+        _session_summaries[sid] = fingerprint
+    _session_summaries.move_to_end(sid)
+    while len(_session_summaries) > _MAX_TRACKED_SESSIONS:
+        _session_summaries.popitem(last=False)
+    return known, previous
 
 
 def _run_hook(event: str, payload: dict[str, Any], timeout: float = _TIMEOUT) -> dict[str, Any] | None:
@@ -80,15 +132,25 @@ def _pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
         prompt = kwargs["user_message"]
     if prompt:
         _run_hook("userpromptsubmit", {"prompt": prompt, "session_id": sid, "cwd": _project(kwargs)})
+    fingerprint = _compaction_fingerprint(kwargs.get("conversation_history"))
     with _state_lock:
-        first = sid not in _seen_sessions or bool(kwargs.get("is_first_turn"))
-        _seen_sessions.add(sid)
-    source = "compact" if kwargs.get("compaction_applied") else ("startup" if first else None)
+        known, previous = _remember_session(sid, fingerprint)
+        first = not known or bool(kwargs.get("is_first_turn"))
+    # ``compaction_applied`` is retained for forward compatibility. Current
+    # Hermes does not send it, so the exact summary-metadata edge is the live
+    # signal. Compact wins over ``is_first_turn`` because session rotation can
+    # intentionally clear the flush baseline during the compaction turn.
+    compact = bool(kwargs.get("compaction_applied")) or (
+        fingerprint is not None and fingerprint != previous
+    )
+    source = "compact" if compact else ("startup" if first else None)
     if source:
         response = _run_hook("sessionstart", {"source": source, "session_id": sid, "cwd": _project(kwargs)})
         context = response.get("hookSpecificOutput", {}).get("additionalContext") if response else None
         if isinstance(context, str) and context:
-            return {"system_context": context}
+            # Hermes deliberately injects plugin context into the current user
+            # message; ``context`` is the only accepted result key.
+            return {"context": context}
     return None
 
 
@@ -99,7 +161,7 @@ def _session_boundary(source: str, **kwargs: Any) -> None:
     else:
         _run_hook("stop", {"session_id": sid, "cwd": _project(kwargs)})
     if source in {"clear", "finalize"}:
-        with _state_lock: _seen_sessions.discard(sid)
+        with _state_lock: _session_summaries.pop(sid, None)
 
 
 def _dispatch_index(args: dict[str, Any]) -> Any:
