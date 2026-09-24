@@ -608,9 +608,12 @@ prompts/tool events in the existing SessionDB pipeline and replaces eligible
 oversized read-only results only after `mcp__context_mode__ctx_index` confirms
 success. All bridge subprocesses are bounded and fail open. Tool-input
 rewrites are not exposed by Hermes' public plugin API, so redirects become
-enforceable denials. Hermes reports compaction on `pre_llm_call`; the plugin
-runs the exact `compact` session-start path and injects its continuity context
-into that same model call. Storage is isolated at
+enforceable denials. Hermes invokes `pre_llm_call` after compaction with its
+rebuilt in-memory history. The plugin detects each new marked compaction
+summary once, runs the exact `compact` session-start path, and returns its
+continuity block through Hermes' user-message context channel in that same
+model call. A future explicit `compaction_applied` flag remains supported but
+is not required. Storage is isolated at
 `$HERMES_HOME/context-mode` (normally `~/.hermes/context-mode`). Memory-provider
 and context-engine APIs are not used.
 

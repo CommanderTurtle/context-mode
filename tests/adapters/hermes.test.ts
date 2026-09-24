@@ -76,10 +76,28 @@ c.delay=True; m._INDEX_TIMEOUT=0.01
 started=time.monotonic()
 assert c.hooks["transform_tool_result"]("read_file", large, session_id="s", tool_call_id="slow") is None
 assert time.monotonic()-started < 0.1
-r=c.hooks["pre_llm_call"](session_id="fresh", user_message="hello", is_first_turn=True, compaction_applied=False)
-assert r == {"system_context":"continuity"}
-r=c.hooks["pre_llm_call"](session_id="fresh", user_message="next", is_first_turn=False, compaction_applied=True)
-assert r == {"system_context":"continuity"}
+hook_calls=[]
+real_run_hook=m._run_hook
+def traced_run_hook(event, payload, timeout=m._TIMEOUT):
+ hook_calls.append((event, payload))
+ return real_run_hook(event, payload, timeout)
+m._run_hook=traced_run_hook
+r=c.hooks["pre_llm_call"](session_id="fresh", user_message="hello", conversation_history=[{"role":"user","content":"hello"}], is_first_turn=True)
+assert r == {"context":"continuity"}
+r=c.hooks["pre_llm_call"](session_id="fresh", user_message="next", conversation_history=[{"role":"user","content":"next"}], is_first_turn=False)
+assert r is None
+summary_a=[{"role":"user","content":"summary A","_compressed_summary":True}]
+r=c.hooks["pre_llm_call"](session_id="fresh", user_message="after compact", conversation_history=summary_a, is_first_turn=False)
+assert r == {"context":"continuity"}
+r=c.hooks["pre_llm_call"](session_id="fresh", user_message="ordinary turn", conversation_history=summary_a, is_first_turn=False)
+assert r is None
+summary_b=[{"role":"assistant","content":"summary B","_compressed_summary":True}]
+r=c.hooks["pre_llm_call"](session_id="fresh", user_message="after another compact", conversation_history=summary_b, is_first_turn=False)
+assert r == {"context":"continuity"}
+r=c.hooks["pre_llm_call"](session_id="fresh", user_message="future host", conversation_history=summary_b, is_first_turn=False, compaction_applied=True)
+assert r == {"context":"continuity"}
+sources=[payload["source"] for event,payload in hook_calls if event == "sessionstart"]
+assert sources == ["startup","compact","compact","compact"]
 print("ok")
 `;
     const run = spawnSync("python3", ["-c", harness], { encoding: "utf8", timeout: 10_000, env: { ...process.env, CONTEXT_MODE_EXECUTABLE: stub } });
